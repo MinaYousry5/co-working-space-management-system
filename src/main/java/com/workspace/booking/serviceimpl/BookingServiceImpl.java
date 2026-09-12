@@ -2,6 +2,8 @@ package com.workspace.booking.serviceimpl;
 
 import com.workspace.booking.common.enums.BookingStatus;
 import com.workspace.booking.common.enums.DurationType;
+import com.workspace.booking.common.enums.PaymentStatus;
+import com.workspace.booking.common.enums.PaymentTransactionType;
 import com.workspace.booking.common.enums.YesNo;
 import com.workspace.booking.common.exception.BookingOverlapException;
 import com.workspace.booking.common.exception.InvalidBookingTimeException;
@@ -10,18 +12,22 @@ import com.workspace.booking.dto.booking.BookingCancelResponse;
 import com.workspace.booking.dto.booking.BookingCreateRequest;
 import com.workspace.booking.dto.booking.BookingResponse;
 import com.workspace.booking.entity.booking.Booking;
+import com.workspace.booking.entity.finance.Payment;
 import com.workspace.booking.entity.identity.User;
 import com.workspace.booking.entity.workspace.Workspace;
 import com.workspace.booking.mapper.BookingMapper;
 import com.workspace.booking.repository.BookingRepository;
+import com.workspace.booking.repository.PaymentRepository;
 import com.workspace.booking.repository.UserRepository;
 import com.workspace.booking.repository.WorkspaceRepository;
+import com.workspace.booking.service.EmailService;
 import com.workspace.booking.service.BookingService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -47,7 +53,12 @@ public class BookingServiceImpl implements BookingService {
     private final BookingRepository bookingRepository;
     private final WorkspaceRepository workspaceRepository;
     private final UserRepository userRepository;
+    private final PaymentRepository paymentRepository;
+    private final EmailService emailService;
     private final BookingMapper bookingMapper;
+
+    @Value("${server.ip}")
+    private String serverIp;
 
     @Override
     @Transactional
@@ -82,7 +93,9 @@ public class BookingServiceImpl implements BookingService {
                 .build();
         booking.setTotalAmount(booking.getBasePrice().subtract(booking.getDiscountAmount()).add(booking.getTaxAmount()));
         log.info("The saved for booking is: "+booking);
-        return bookingMapper.toResponse(bookingRepository.save(booking));
+        Booking savedBooking = bookingRepository.save(booking);
+        sendBookingPaymentInstructionEmail(savedBooking);
+        return bookingMapper.toResponse(savedBooking);
     }
 
     @Override
@@ -109,6 +122,7 @@ public class BookingServiceImpl implements BookingService {
         LocalDateTime originalEnd = booking.getEndDatetime();
 
         boolean cancelWholeBooking = cancelStart.equals(originalStart) && cancelEnd.equals(originalEnd);
+        BigDecimal refundAmount = calculateRefundAmount(booking, cancelStart, cancelEnd, cancelWholeBooking);
         if (cancelWholeBooking) {
             markCancelled(booking, cancelledBy, request.reason());
         } else if (cancelStart.equals(originalStart)) {
@@ -133,6 +147,7 @@ public class BookingServiceImpl implements BookingService {
         }
 
         Booking savedBooking = bookingRepository.save(booking);
+        createRefundRequestIfEligible(savedBooking, refundAmount, request.reason());
         return new BookingCancelResponse(
                 bookingMapper.toResponse(savedBooking),
                 remaining.stream().map(bookingMapper::toResponse).toList()
@@ -290,5 +305,53 @@ public class BookingServiceImpl implements BookingService {
 
     private String generateBookingRef() {
         return "BK-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
+    }
+
+    private void sendBookingPaymentInstructionEmail(Booking booking) {
+        String paymentLink = serverIp + "payment?bookingId=" + booking.getId();
+        String body = "Thanks for booking and to confirm booking please send your fees "
+                + booking.getTotalAmount() + " " + booking.getCurrency()
+                + " in 24 hrs to confirm booking and you can pay on\n"
+                + "vodafone cash : 01099070589 or instapay on : 01099070589\n"
+                + "and when pay please fill the form in this link : " + paymentLink;
+
+        emailService.sendEmail(
+                booking.getUser().getEmail(),
+                "Booking payment confirmation",
+                body
+        );
+    }
+
+    private BigDecimal calculateRefundAmount(Booking booking, LocalDateTime cancelStart, LocalDateTime cancelEnd, boolean cancelWholeBooking) {
+        if (cancelWholeBooking) {
+            return booking.getTotalAmount();
+        }
+        return calculateBasePrice(booking.getWorkspace(), booking.getDurationType(), cancelStart, cancelEnd);
+    }
+
+    private void createRefundRequestIfEligible(Booking booking, BigDecimal refundAmount, String reason) {
+        boolean hasConfirmedPayment = paymentRepository
+                .findFirstByBookingIdAndTransactionTypeAndStatus(
+                        booking.getId(),
+                        PaymentTransactionType.PAYMENT,
+                        PaymentStatus.CONFIRMED
+                )
+                .isPresent();
+
+        boolean beforeReservationByMoreThan24Hours = booking.getStartDatetime().isAfter(LocalDateTime.now().plusHours(24));
+        if (!hasConfirmedPayment || !beforeReservationByMoreThan24Hours) {
+            return;
+        }
+
+        Payment refundPayment = Payment.builder()
+                .booking(booking)
+                .user(booking.getUser())
+                .transactionType(PaymentTransactionType.REFUND)
+                .status(PaymentStatus.PENDING)
+                .amount(BigDecimal.ZERO)
+                .refundAmount(refundAmount)
+                .reasonOfReject(reason)
+                .build();
+        paymentRepository.save(refundPayment);
     }
 }

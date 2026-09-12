@@ -45,6 +45,7 @@ public class SecurityConfig {
                         .requestMatchers("/api/v1/support/newsletter").permitAll()
                         .requestMatchers("/api/v1/support/articles").permitAll()
                         .requestMatchers("/api/v1/bookings/availability").permitAll()
+                        .requestMatchers("/api/v1/payments/bookings/**").permitAll()
                         .requestMatchers("/api/v1/reviews").permitAll()
                         .requestMatchers("/api/v1/reviews/summary").permitAll()
                         .requestMatchers("/api/v1/reviews/rating/rating-counts").permitAll()
